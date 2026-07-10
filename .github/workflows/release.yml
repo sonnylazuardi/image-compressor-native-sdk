@@ -64,7 +64,16 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install Native SDK CLI
-        run: npm install -g "@native-sdk/cli@${{ env.NATIVE_CLI_VERSION }}"
+        # Install into the workspace (not globally). On windows-latest the
+        # checkout is on D: while npm's global prefix is on C:, and Zig
+        # rejects absolute path deps in build.zig.zon — a same-drive
+        # node_modules path stays relative from .native/build/.
+        shell: bash
+        run: |
+          npm install "@native-sdk/cli@${{ env.NATIVE_CLI_VERSION }}"
+          echo "${GITHUB_WORKSPACE}/node_modules/.bin" >> "$GITHUB_PATH"
+          test -f node_modules/@native-sdk/cli/src/root.zig
+          native --version
 
       - name: Resolve version
         shell: bash
