@@ -1,9 +1,9 @@
 <!-- Full native compressor UI. Hot-reloaded by native dev. -->
 <column grow="1" padding="14" gap="10" background="background">
-  <!-- Caption drag row: pads around OS caption buttons (Windows: trailing) -->
+  <!-- Caption drag row: macOS centers the title; Windows keeps it start-aligned -->
   <row gap="8" cross="center" window-drag="true" height="{chrome_top}">
     <spacer width="{chrome_leading}" />
-    <text grow="1">Compressor</text>
+    <text grow="1" text-alignment="{titleAlignment}">Compressor</text>
     <spacer width="{chrome_trailing}" />
   </row>
 
@@ -15,10 +15,19 @@
       size="sm"
       variant="primary"
       icon="play"
-      disabled="{busyOrNoFile}"
+      disabled="{busyOrNoFileOrNoBun}"
       on-press="compress"
     >{compressLabel}</button>
   </row>
+
+  <if test="{showBunBanner}">
+    <row gap="10" cross="center" padding="12" background="surface" radius="md">
+      <text grow="1" wrap="true">{bunBannerText}</text>
+      <if test="{showBunRetry}">
+        <button size="sm" variant="secondary" on-press="retry_bun_setup">Retry</button>
+      </if>
+    </row>
+  </if>
 
   <!-- Settings: quality slider (default 80%) -->
   <if test="{settings_open}">

@@ -26,9 +26,24 @@ const max_error_bytes = 192;
 pub const browse_key: u64 = 1;
 pub const compress_key: u64 = 2;
 pub const preview_key: u64 = 3;
+pub const bun_install_key: u64 = 4;
 pub const preview_image_id_base: u64 = 100;
 
-const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
+/// Persistent storage for PATH updates via setenv (value must outlive the call).
+var refreshed_path_env: [4096]u8 = undefined;
+
+pub const BunState = enum {
+    checking,
+    ready,
+    installing,
+    failed,
+};
+
+const app_permissions = [_][]const u8{
+    native_sdk.security.permission_command,
+    native_sdk.security.permission_view,
+    native_sdk.security.permission_dialog,
+};
 const shell_views = [_]native_sdk.ShellView{
     .{
         .label = canvas_label,
@@ -79,13 +94,22 @@ pub const Msg = union(enum) {
     set_preset_medium,
     set_preset_heavy,
     quality_changed,
+    retry_bun_setup,
     files_dropped: DroppedPaths,
     preview_exited: native_sdk.EffectExit,
     browse_exited: native_sdk.EffectExit,
     compress_exited: native_sdk.EffectExit,
+    bun_install_exited: native_sdk.EffectExit,
     chrome_changed: native_sdk.WindowChrome,
 
-    pub const view_unbound = .{ "chrome_changed", "browse_exited", "compress_exited", "files_dropped", "preview_exited" };
+    pub const view_unbound = .{
+        "chrome_changed",
+        "browse_exited",
+        "compress_exited",
+        "bun_install_exited",
+        "files_dropped",
+        "preview_exited",
+    };
 };
 
 /// Paths copied out of a platform `files_dropped` event (UiApp ignores those
@@ -135,22 +159,33 @@ pub const Model = struct {
     preview_image: canvas.ImageId = 0,
     preview_generation: u64 = 0,
 
-    chrome_leading: f32 = 0,
-    chrome_trailing: f32 = 140,
+    bun_state: BunState = .checking,
+    bun_path_storage: [max_path_bytes]u8 = undefined,
+    bun_path_len: usize = 0,
+    bun_banner_storage: [max_status_bytes]u8 = undefined,
+    bun_banner_len: usize = 0,
+
+    // macOS: equal pads so the title centers in the window (traffic lights on the leading edge).
+    // Windows: trailing pad reserves caption-button space; title stays start-aligned.
+    chrome_leading: f32 = if (builtin.os.tag == .macos) 78 else 0,
+    chrome_trailing: f32 = if (builtin.os.tag == .macos) 78 else 140,
     chrome_top: f32 = 36,
     header_height: f32 = header_natural_height,
 
     /// Storage / internal fields only read from Zig (not markup bindings).
     pub const view_unbound = .{
-        "path_storage",  "path_len",
-        "name_storage",  "name_len",
-        "output_storage","output_len",
-        "status_storage","status_len",
-        "error_storage", "error_len",
-        "quality",       "busy",
-        "input_bytes",   "output_bytes",
-        "has_result",    "header_height",
+        "path_storage",       "path_len",
+        "name_storage",       "name_len",
+        "output_storage",     "output_len",
+        "status_storage",     "status_len",
+        "error_storage",      "error_len",
+        "quality",            "busy",
+        "input_bytes",        "output_bytes",
+        "has_result",         "header_height",
         "preview_generation",
+        "bun_state",
+        "bun_path_storage",   "bun_path_len",
+        "bun_banner_storage", "bun_banner_len",
     };
 
     pub fn pathText(model: *const Model) []const u8 {
@@ -194,6 +229,56 @@ pub const Model = struct {
         return model.busy or model.path_len == 0;
     }
 
+    pub fn bunReady(model: *const Model) bool {
+        return model.bun_state == .ready and model.bun_path_len > 0;
+    }
+
+    pub fn bunBusy(model: *const Model) bool {
+        return model.bun_state == .checking or model.bun_state == .installing;
+    }
+
+    pub fn showBunBanner(model: *const Model) bool {
+        return model.bun_state != .ready;
+    }
+
+    pub fn showBunRetry(model: *const Model) bool {
+        return model.bun_state == .failed;
+    }
+
+    pub fn busyOrNoFileOrNoBun(model: *const Model) bool {
+        return model.busyOrNoFile() or !model.bunReady();
+    }
+
+    pub fn bunPath(model: *const Model) []const u8 {
+        return model.bun_path_storage[0..model.bun_path_len];
+    }
+
+    pub fn bunBannerText(model: *const Model) []const u8 {
+        if (model.bun_banner_len > 0) return model.bun_banner_storage[0..model.bun_banner_len];
+        return switch (model.bun_state) {
+            .checking => "Checking for Bun…",
+            .installing => "Installing Bun…",
+            .failed => "Couldn’t set up Bun. Retry or install from https://bun.sh",
+            .ready => "",
+        };
+    }
+
+    pub fn setBunPath(model: *Model, path: []const u8) void {
+        const len = @min(path.len, max_path_bytes);
+        @memcpy(model.bun_path_storage[0..len], path[0..len]);
+        model.bun_path_len = len;
+    }
+
+    pub fn clearBunPath(model: *Model) void {
+        model.bun_path_len = 0;
+    }
+
+    pub fn setBunBanner(model: *Model, text: []const u8) void {
+        const len = @min(text.len, max_status_bytes);
+        @memcpy(model.bun_banner_storage[0..len], text[0..len]);
+        model.bun_banner_len = len;
+    }
+
     pub fn qualityFraction(model: *const Model) f32 {
         return @as(f32, @floatFromInt(model.quality)) / 100.0;
     }
@@ -230,10 +315,19 @@ pub const Model = struct {
     }
 
     pub fn statusLabel(model: *const Model) []const u8 {
+        if (model.bun_state == .installing) return "Setting up Bun…";
+        if (model.bun_state == .checking) return "Checking for Bun…";
+        if (model.bun_state == .failed) return "Bun setup needed";
         if (model.busy) return "Compressing…";
         if (model.has_result) return "Saved";
         if (model.path_len > 0) return "Ready";
         return "Drop or browse an image";
+    }
+
+    /// macOS centers the window title; Windows keeps it start-aligned beside caption chrome.
+    pub fn titleAlignment(model: *const Model) []const u8 {
+        _ = model;
+        return if (comptime builtin.os.tag == .macos) "center" else "start";
     }
 
     pub fn setPath(model: *Model, path: []const u8) void {
@@ -368,11 +462,229 @@ fn extractJsonString(payload: []const u8, field: []const u8) ?[]const u8 {
 pub const CompressorApp = native_sdk.UiApp(Model, Msg);
 pub const Effects = CompressorApp.Effects;
 
+// ----------------------------------------------------------- bun onboarding
+
+fn pathExists(path: []const u8) bool {
+    if (path.len == 0 or path.len >= max_path_bytes) return false;
+    var zbuf: [max_path_bytes + 1]u8 = undefined;
+    @memcpy(zbuf[0..path.len], path);
+    zbuf[path.len] = 0;
+    return std.c.access(zbuf[0..path.len :0].ptr, std.c.F_OK) == 0;
+}
+
+fn envGet(name: [*:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
+}
+
+fn homeDir(buffer: []u8) ?[]const u8 {
+    const key: [*:0]const u8 = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    const home = envGet(key) orelse return null;
+    const len = @min(home.len, buffer.len);
+    @memcpy(buffer[0..len], home[0..len]);
+    return buffer[0..len];
+}
+
+fn defaultBunInstallPath(buffer: []u8) ?[]const u8 {
+    var home_buf: [max_path_bytes]u8 = undefined;
+    const home = homeDir(&home_buf) orelse return null;
+    if (builtin.os.tag == .windows) {
+        return std.fmt.bufPrint(buffer, "{s}\\.bun\\bin\\bun.exe", .{home}) catch null;
+    }
+    return std.fmt.bufPrint(buffer, "{s}/.bun/bin/bun", .{home}) catch null;
+}
+
+fn defaultBunBinDir(buffer: []u8) ?[]const u8 {
+    var home_buf: [max_path_bytes]u8 = undefined;
+    const home = homeDir(&home_buf) orelse return null;
+    if (builtin.os.tag == .windows) {
+        return std.fmt.bufPrint(buffer, "{s}\\.bun\\bin", .{home}) catch null;
+    }
+    return std.fmt.bufPrint(buffer, "{s}/.bun/bin", .{home}) catch null;
+}
+
+/// Resolve `bun` from PATH by scanning PATH entries for a bun binary.
+fn findBunOnPath(buffer: []u8) ?[]const u8 {
+    const path_env = envGet("PATH") orelse return null;
+    const sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
+    var it = std.mem.splitScalar(u8, path_env, sep);
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = if (builtin.os.tag == .windows)
+            std.fmt.bufPrint(buffer, "{s}\\bun.exe", .{dir}) catch continue
+        else
+            std.fmt.bufPrint(buffer, "{s}/bun", .{dir}) catch continue;
+        if (pathExists(candidate)) return candidate;
+        if (builtin.os.tag == .windows) {
+            const no_ext = std.fmt.bufPrint(buffer, "{s}\\bun", .{dir}) catch continue;
+            if (pathExists(no_ext)) return no_ext;
+        }
+    }
+    return null;
+}
+
+/// Probe PATH then the default Bun install location. Returns absolute path in `buffer`.
+pub fn probeBunExecutable(buffer: []u8) ?[]const u8 {
+    if (findBunOnPath(buffer)) |found| return found;
+    if (defaultBunInstallPath(buffer)) |fallback| {
+        if (pathExists(fallback)) return fallback;
+    }
+    return null;
+}
+
+fn prependPathDir(dir: []const u8) void {
+    if (dir.len == 0) return;
+    const current = envGet("PATH") orelse "";
+    const sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
+    if (current.len > 0) {
+        var it = std.mem.splitScalar(u8, current, sep);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry, dir)) return;
+        }
+    }
+
+    const joined = if (current.len == 0)
+        std.fmt.bufPrint(&refreshed_path_env, "{s}", .{dir}) catch return
+    else
+        std.fmt.bufPrint(&refreshed_path_env, "{s}{c}{s}", .{ dir, sep, current }) catch return;
+
+    if (joined.len + 1 > refreshed_path_env.len) return;
+    refreshed_path_env[joined.len] = 0;
+    const zpath: [*:0]const u8 = refreshed_path_env[0..joined.len :0].ptr;
+
+    if (builtin.os.tag == .windows) {
+        const SetEnvironmentVariableA = struct {
+            extern "kernel32" fn SetEnvironmentVariableA(name: [*:0]const u8, value: ?[*:0]const u8) callconv(.winapi) c_int;
+        }.SetEnvironmentVariableA;
+        _ = SetEnvironmentVariableA("PATH", zpath);
+    } else {
+        const setenv = struct {
+            extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        }.setenv;
+        _ = setenv("PATH", zpath, 1);
+    }
+}
+
+fn refreshBunPathEnv() void {
+    var bin_buf: [max_path_bytes]u8 = undefined;
+    if (defaultBunBinDir(&bin_buf)) |bin_dir| {
+        if (pathExists(bin_dir)) prependPathDir(bin_dir);
+    }
+}
+
+fn markBunReady(model: *Model, fx: *Effects, path: []const u8) void {
+    model.setBunPath(path);
+    model.bun_state = .ready;
+    model.setBunBanner("");
+    model.clearError();
+    model.setStatus("Bun ready");
+    // If the user already picked a file while Bun was installing, load preview now.
+    if (model.path_len > 0 and model.preview_image == 0) {
+        startPreviewLoad(model, fx);
+    }
+}
+
+fn markBunFailed(model: *Model, detail: []const u8) void {
+    model.bun_state = .failed;
+    model.clearBunPath();
+    if (detail.len > 0) {
+        model.setBunBanner(detail);
+        model.setError(detail);
+    } else {
+        model.setBunBanner("Couldn’t install Bun. Retry, or install from https://bun.sh then Retry.");
+        model.setError("Bun setup failed");
+    }
+    model.setStatus("Bun setup failed");
+}
+
+pub fn ensureBun(model: *Model, fx: *Effects) void {
+    fx.cancel(bun_install_key);
+    model.bun_state = .checking;
+    model.setBunBanner("Checking for Bun…");
+    model.setStatus("Checking for Bun…");
+    model.clearError();
+
+    var path_buf: [max_path_bytes]u8 = undefined;
+    if (probeBunExecutable(&path_buf)) |found| {
+        // Prefer storing the resolved absolute path for later spawns.
+        markBunReady(model, fx, found);
+        return;
+    }
+
+    startBunInstall(model, fx);
+}
+
+fn startBunInstall(model: *Model, fx: *Effects) void {
+    model.bun_state = .installing;
+    model.clearBunPath();
+    model.setBunBanner("Installing Bun…");
+    model.setStatus("Installing Bun…");
+    model.clearError();
+
+    const argv = if (builtin.os.tag == .windows) [_][]const u8{
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "irm https://bun.sh/install.ps1 | iex",
+    } else [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "curl -fsSL https://bun.sh/install | bash",
+    };
+    fx.spawn(.{
+        .key = bun_install_key,
+        .argv = &argv,
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.bun_install_exited),
+    });
+}
+
+fn handleBunInstallExit(model: *Model, fx: *Effects, exit: native_sdk.EffectExit) void {
+    if (exit.key != bun_install_key) return;
+    if (exit.reason == .cancelled) return;
+
+    if (exit.reason != .exited or exit.code != 0) {
+        const msg = firstLine(exit.stderr_tail);
+        if (msg.len > 0) {
+            markBunFailed(model, msg);
+        } else if (exit.output.len > 0) {
+            markBunFailed(model, firstLine(exit.output));
+        } else {
+            markBunFailed(model, "Couldn’t install Bun. Retry, or install from https://bun.sh then Retry.");
+        }
+        return;
+    }
+
+    refreshBunPathEnv();
+
+    var path_buf: [max_path_bytes]u8 = undefined;
+    if (probeBunExecutable(&path_buf)) |found| {
+        markBunReady(model, fx, found);
+        return;
+    }
+    markBunFailed(model, "Bun installed but isn’t runnable yet. Retry, or open a new terminal and Retry.");
+}
+
+fn initFx(model: *Model, fx: *Effects) void {
+    ensureBun(model, fx);
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .chrome_changed => |chrome| {
-            model.chrome_leading = chrome.insets.left;
-            model.chrome_trailing = @max(140, chrome.insets.right);
+            const leading = chrome.insets.left;
+            const trailing = chrome.insets.right;
+            if (comptime builtin.os.tag == .macos) {
+                // Mirror the larger inset on both sides so "Compressor" sits on the window centerline.
+                const pad = @max(leading, trailing);
+                model.chrome_leading = pad;
+                model.chrome_trailing = pad;
+            } else {
+                model.chrome_leading = leading;
+                model.chrome_trailing = @max(140, trailing);
+            }
             if (chrome.insets.top > 0) {
                 model.chrome_top = @max(36, chrome.insets.top);
                 model.header_height = @max(header_natural_height, chrome.insets.top);
@@ -397,6 +709,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .quality_changed => {
             // Value mirrored by Options.sync from the live slider widget.
         },
+        .retry_bun_setup => ensureBun(model, fx),
         .files_dropped => |dropped| handleFilesDropped(model, fx, dropped),
         .preview_exited => |exit| handlePreviewExit(model, fx, exit),
         .clear => clearSelection(model, fx),
@@ -404,6 +717,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .compress => startCompress(model, fx),
         .browse_exited => |exit| handleBrowseExit(model, fx, exit),
         .compress_exited => |exit| handleCompressExit(model, exit),
+        .bun_install_exited => |exit| handleBunInstallExit(model, fx, exit),
     }
 }
 
@@ -428,13 +742,14 @@ fn selectPath(model: *Model, fx: *Effects, path: []const u8) void {
 
 fn startPreviewLoad(model: *Model, fx: *Effects) void {
     if (model.path_len == 0) return;
+    if (!model.bunReady()) return;
     // Native fx.readFile caps at 1 MiB and truncates larger files, which
     // breaks PNG/JPEG decode. Bun builds a small thumbnail that always fits
     // the spawn collect budget (512 KiB).
     model.preview_generation +%= 1;
     if (model.preview_generation == 0) model.preview_generation = 1;
     const argv = [_][]const u8{
-        "bun",
+        model.bunPath(),
         "run",
         "scripts/preview.ts",
         "--input",
@@ -477,16 +792,39 @@ fn isImagePath(path: []const u8) bool {
     return false;
 }
 
+/// Normalize OS drop / dialog paths: trim whitespace, strip `file://`, keep POSIX/Win paths.
+pub fn normalizeIncomingPath(path: []const u8, buffer: []u8) ?[]const u8 {
+    var trimmed = std.mem.trim(u8, path, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.startsWith(u8, trimmed, "file://")) {
+        trimmed = trimmed["file://".len..];
+        // file:///Users/... → /Users/...
+        if (trimmed.len >= 2 and trimmed[0] == '/' and trimmed[1] == '/') {
+            // host-less absolute: ///path or //localhost/path
+            if (std.mem.startsWith(u8, trimmed, "///")) {
+                trimmed = trimmed[2..]; // keep one leading /
+            } else if (std.mem.startsWith(u8, trimmed, "//localhost")) {
+                trimmed = trimmed["//localhost".len..];
+            }
+        }
+    }
+    if (trimmed.len == 0) return null;
+    const len = @min(trimmed.len, buffer.len);
+    @memcpy(buffer[0..len], trimmed[0..len]);
+    return buffer[0..len];
+}
+
 fn handleFilesDropped(model: *Model, fx: *Effects, dropped: DroppedPaths) void {
     if (model.busy) return;
     if (dropped.count == 0) {
         model.setStatus("Drop cancelled");
         return;
     }
+    var norm_buf: [max_path_bytes]u8 = undefined;
     var i: usize = 0;
     while (i < dropped.count) : (i += 1) {
-        const path = dropped.pathAt(i);
-        if (path.len == 0) continue;
+        const raw = dropped.pathAt(i);
+        const path = normalizeIncomingPath(raw, &norm_buf) orelse continue;
         if (!isImagePath(path)) {
             model.setError("Drop an image file (.jpg, .png, .webp, …)");
             model.setStatus("Unsupported file type");
@@ -498,11 +836,54 @@ fn handleFilesDropped(model: *Model, fx: *Effects, dropped: DroppedPaths) void {
     model.setStatus("Drop cancelled");
 }
 
+const image_open_filter = native_sdk.FileFilter{
+    .name = "Images",
+    .extensions = &.{ "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif" },
+};
+
 fn startBrowse(model: *Model, fx: *Effects) void {
     if (model.busy) return;
     model.clearError();
     model.setStatus("Opening file picker…");
-    // Platform file dialogs print a single path on stdout.
+
+    // Prefer the platform native open dialog (NSOpenPanel / Win32). Spawning
+    // osascript/PowerShell from a GUI app is unreliable on macOS and can fail
+    // silently when the process has no TTY / Automation permission.
+    if (fx.services) |services| {
+        var path_buf: [native_sdk.platform.max_dialog_paths_bytes]u8 = undefined;
+        const result = services.showOpenDialog(.{
+            .title = "Choose an image",
+            .filters = &.{image_open_filter},
+            .allow_multiple = false,
+        }, &path_buf) catch |err| {
+            model.setError("Could not open file picker");
+            model.setStatus(@errorName(err));
+            return;
+        };
+        if (result.count == 0 or result.paths.len == 0) {
+            model.setStatus("Browse cancelled");
+            return;
+        }
+        var norm_buf: [max_path_bytes]u8 = undefined;
+        const path = normalizeIncomingPath(firstLine(result.paths), &norm_buf) orelse {
+            model.setStatus("Browse cancelled");
+            return;
+        };
+        if (!isImagePath(path)) {
+            model.setError("Choose an image file (.jpg, .png, .webp, …)");
+            model.setStatus("Unsupported file type");
+            return;
+        }
+        selectPath(model, fx, path);
+        return;
+    }
+
+    // Test / unbound-services fallback: keep the old spawn dialogs.
+    startBrowseSpawnFallback(model, fx);
+}
+
+fn startBrowseSpawnFallback(model: *Model, fx: *Effects) void {
+    _ = model;
     const argv = if (builtin.os.tag == .windows) [_][]const u8{
         "powershell",
         "-NoProfile",
@@ -530,16 +911,21 @@ fn handleBrowseExit(model: *Model, fx: *Effects, exit: native_sdk.EffectExit) vo
         model.setStatus("Browse cancelled");
         return;
     }
-    const path = firstLine(exit.output);
-    if (path.len == 0) {
+    var norm_buf: [max_path_bytes]u8 = undefined;
+    const path = normalizeIncomingPath(firstLine(exit.output), &norm_buf) orelse {
         model.setStatus("Browse cancelled");
+        return;
+    };
+    if (!isImagePath(path)) {
+        model.setError("Choose an image file (.jpg, .png, .webp, …)");
+        model.setStatus("Unsupported file type");
         return;
     }
     selectPath(model, fx, path);
 }
 
 fn startCompress(model: *Model, fx: *Effects) void {
-    if (model.busy or model.path_len == 0) return;
+    if (model.busy or model.path_len == 0 or !model.bunReady()) return;
     model.busy = true;
     model.clearError();
     model.setStatus("Compressing with Bun…");
@@ -555,9 +941,9 @@ fn startCompress(model: *Model, fx: *Effects) void {
     var quality_buf: [8]u8 = undefined;
     const quality_text = std.fmt.bufPrint(&quality_buf, "{d}", .{model.quality}) catch "80";
 
-    // argv slices must live until spawn copies them — use model path/output storage.
+    // argv slices must live until spawn copies them — use model path/output/bun storage.
     const argv = [_][]const u8{
-        "bun",
+        model.bunPath(),
         "run",
         "scripts/compress.ts",
         "--input",
@@ -626,23 +1012,35 @@ pub fn initialModel() Model {
     return .{};
 }
 
-/// UiApp's event switch ignores `.files_dropped` today. Wrap the generated
-/// App so OS drops still reach `update` as `Msg.files_dropped`.
+/// UiApp's event switch ignores `.files_dropped` today. Keep a stable App
+/// value (with our event_fn) for the runner — do not rebuild it from
+/// `app_state.app()` on each call site without overwriting event_fn.
+var file_drop_app_storage: ?native_sdk.App = null;
+
 fn wrapAppWithFileDrops(app_state: *CompressorApp) native_sdk.App {
     var app = app_state.app();
     app.context = app_state;
     app.event_fn = fileDropEventFn;
-    return app;
+    file_drop_app_storage = app;
+    return file_drop_app_storage.?;
 }
 
 fn fileDropEventFn(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
     const self: *CompressorApp = @ptrCast(@alignCast(context));
+    // Run the normal UiApp handler first (pointer/keyboard/frame/etc).
     const base = self.app();
     try base.event(runtime, event_value);
     switch (event_value) {
         .files_dropped => |drop| {
             if (drop.paths.len == 0) return;
-            try self.dispatch(runtime, self.canvas_window_id, .{ .files_dropped = DroppedPaths.fromPaths(drop.paths) });
+            // Copy paths before any further work — platform drop buffers are transient.
+            const copied = DroppedPaths.fromPaths(drop.paths);
+            try self.dispatch(runtime, self.canvas_window_id, .{ .files_dropped = copied });
+        },
+        .canvas_widget_file_drop => |widget_drop| {
+            if (widget_drop.drop.paths.len == 0) return;
+            const copied = DroppedPaths.fromPaths(widget_drop.drop.paths);
+            try self.dispatch(runtime, self.canvas_window_id, .{ .files_dropped = copied });
         },
         else => {},
     }
@@ -706,6 +1104,7 @@ pub fn main(init: std.process.Init) !void {
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .update_fx = update,
+        .init_fx = initFx,
         .sync = syncModel,
         .on_chrome = onChrome,
         .on_command = command,

@@ -104,14 +104,36 @@ test "command shortcuts map to messages" {
     try testing.expectEqual(@as(?Msg, .browse), main.command(main.cmd_browse));
 }
 
+test "normalizeIncomingPath strips file URL and whitespace" {
+    var buf: [512]u8 = undefined;
+    const a = main.normalizeIncomingPath("  /tmp/photo.png\n", &buf).?;
+    try testing.expectEqualStrings("/tmp/photo.png", a);
+    const b = main.normalizeIncomingPath("file:///Users/me/shot.JPG", &buf).?;
+    try testing.expectEqualStrings("/Users/me/shot.JPG", b);
+}
+
 test "dropped image path selects file" {
     var model = main.initialModel();
+    model.setBunPath("/usr/bin/bun");
+    model.bun_state = .ready;
     var fx = main.Effects.init(testing.allocator);
     defer fx.deinit();
     const dropped = main.DroppedPaths.fromPaths(&.{"C:\\Users\\me\\photo.PNG"});
     main.update(&model, .{ .files_dropped = dropped }, &fx);
     try testing.expectEqualStrings("C:\\Users\\me\\photo.PNG", model.pathText());
     try testing.expectEqualStrings("photo.PNG", model.fileName());
+}
+
+test "dropped file URL selects file" {
+    var model = main.initialModel();
+    model.setBunPath("/usr/bin/bun");
+    model.bun_state = .ready;
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    const dropped = main.DroppedPaths.fromPaths(&.{"file:///tmp/vacation.png"});
+    main.update(&model, .{ .files_dropped = dropped }, &fx);
+    try testing.expectEqualStrings("/tmp/vacation.png", model.pathText());
+    try testing.expectEqualStrings("vacation.png", model.fileName());
 }
 
 test "dropped non-image is rejected" {
@@ -122,4 +144,75 @@ test "dropped non-image is rejected" {
     main.update(&model, .{ .files_dropped = dropped }, &fx);
     try testing.expect(!model.hasFile());
     try testing.expect(model.hasError());
+}
+
+test "bun helpers gate compress until ready" {
+    var model = main.initialModel();
+    try testing.expectEqual(main.BunState.checking, model.bun_state);
+    try testing.expect(model.showBunBanner());
+    try testing.expect(!model.showBunRetry());
+    try testing.expect(!model.bunReady());
+    try testing.expect(model.busyOrNoFileOrNoBun());
+
+    model.setPath("/tmp/photo.png");
+    try testing.expect(model.busyOrNoFileOrNoBun());
+
+    model.setBunPath("/tmp/fake-bun");
+    model.bun_state = .ready;
+    model.setBunBanner("");
+    try testing.expect(model.bunReady());
+    try testing.expect(!model.showBunBanner());
+    try testing.expect(!model.busyOrNoFileOrNoBun());
+}
+
+test "bun failed state shows retry banner copy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = main.initialModel();
+    model.bun_state = .failed;
+    model.setBunBanner("Couldn’t install Bun. Retry, or install from https://bun.sh then Retry.");
+    try testing.expect(model.showBunBanner());
+    try testing.expect(model.showBunRetry());
+    const tree = try buildTree(arena_state.allocator(), &model);
+    _ = try expectByText(tree.root, .text, "Couldn’t install Bun. Retry, or install from https://bun.sh then Retry.");
+    _ = try expectByText(tree.root, .button, "Retry");
+}
+
+test "bun ready hides banner" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = main.initialModel();
+    model.setBunPath("/usr/local/bin/bun");
+    model.bun_state = .ready;
+    try testing.expect(!model.showBunBanner());
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByText(tree.root, .button, "Retry") == null);
+}
+
+test "failed bun install exit marks failed without network" {
+    var model = main.initialModel();
+    model.bun_state = .installing;
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    const exit: native_sdk.EffectExit = .{
+        .key = main.bun_install_key,
+        .reason = .exited,
+        .code = 1,
+        .stderr_tail = "curl: (6) Could not resolve host",
+    };
+    main.update(&model, .{ .bun_install_exited = exit }, &fx);
+    try testing.expectEqual(main.BunState.failed, model.bun_state);
+    try testing.expect(model.showBunRetry());
+    try testing.expect(!model.bunReady());
+}
+
+test "retry_bun_setup re-enters checking or ready via probe" {
+    var model = main.initialModel();
+    model.bun_state = .failed;
+    model.setBunBanner("failed");
+    var fx = main.Effects.init(testing.allocator);
+    defer fx.deinit();
+    main.update(&model, .retry_bun_setup, &fx);
+    // On machines with Bun installed this becomes ready; otherwise installing.
+    try testing.expect(model.bun_state == .ready or model.bun_state == .installing);
 }
