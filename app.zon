@@ -3,7 +3,7 @@
     .name = "image-compressor",
     .display_name = "Compressor",
     .description = "Convert any image to WebP with adjustable quality.",
-    .version = "0.1.0",
+    .version = "0.1.1",
     .icons = .{ "assets/icon.png", "assets/icon.ico" },
     .platforms = .{ "macos", "windows" },
     .permissions = .{ "view", "command", "dialog" },
