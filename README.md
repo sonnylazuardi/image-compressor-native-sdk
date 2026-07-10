@@ -105,7 +105,31 @@ native dev --yes
 
 # Release binary
 native build
+
+# Distributable package (run on the target OS)
+native package --target macos --signing adhoc --binary zig-out/bin/image-compressor --output zig-out/package/Compressor.app
+native package --target windows --binary zig-out/bin/image-compressor.exe --output zig-out/package/windows
 ```
+
+## Releases (GitHub Actions)
+
+Ship via [GitHub Releases](https://github.com/sonnylazuardi/image-compressor-native-sdk/releases) — same pattern as [gifbin](https://github.com/henryoman/gifbin/releases/tag/v0.0.0): tag a version, CI builds native packages, and [softprops/action-gh-release](https://github.com/softprops/action-gh-release) attaches the zips.
+
+```bash
+# bump app.zon if needed, then:
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Or run **Actions → Release → Run workflow** and pass a version without the leading `v`.
+
+| Artifact | Runner |
+| --- | --- |
+| `Compressor-macos-arm64.zip` (`.app` inside) | `macos-15` |
+| `Compressor-windows-x64.zip` (`.exe` layout) | `windows-latest` |
+| `SHA256SUMS` + per-file `.sha256` | release job |
+
+**macOS:** ad-hoc signed — first open with **right-click → Open**. **Windows:** unsigned — SmartScreen may warn. Both still need Bun on `PATH` for compression.
 
 ## Bun encoder (CLI)
 
@@ -122,7 +146,9 @@ src/app.native                # declarative native UI
 src/main.zig                  # Model / Msg / update_fx / effects
 src/tests.zig                 # dispatch + markup tests
 scripts/compress.ts           # Bun WebP encode
+scripts/set-version.sh        # bump app.zon .version for CI releases
 scripts/setup-windows-zig.ps1 # optional Zig 0.16 install + PATH (Windows)
+.github/workflows/release.yml # tag → macOS + Windows GitHub Release
 assets/icon.png
 ```
 
